@@ -156,7 +156,10 @@ export default function UploadPage() {
         }
 
         const data = await res.json();
-        // Use the Supabase row id for navigation
+        if (data.scan) {
+          saveScan(data.scan);
+        }
+        // Use the scan id for navigation
         if (data.id) {
           setApiError(null);
           router.push(`/results/${data.id}`);

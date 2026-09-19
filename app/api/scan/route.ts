@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { GoogleGenerativeAI } from '@google/generative-ai';
 import { GoogleGenAI } from '@google/genai';
 import { ComplianceScan, FieldResult } from '@/lib/types';
 import { analyzePackageImage } from '@/lib/scanner';
@@ -73,8 +72,19 @@ Respond ONLY with a valid raw JSON object strictly matching this format (no mark
   ]
 }`;
 
-const PRIMARY_MODEL = 'gemini-3.5-flash';
-const FALLBACK_MODEL = 'gemini-3.5-flash-lite';
+// Fast primary model for ultra-low latency; reliable fallback model
+const PRIMARY_MODEL = 'gemini-3.5-flash-lite';
+const FALLBACK_MODEL = 'gemini-3.5-flash';
+
+/** Promise timeout helper */
+function withTimeout<T>(promise: Promise<T> | PromiseLike<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    Promise.resolve(promise) as Promise<T>,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+    ),
+  ]);
+}
 
 /** Helper to execute Gemini vision call for a specific model name */
 async function callGeminiVision(
@@ -113,12 +123,17 @@ function getFieldText(fields: FieldResult[], id: string): string | null {
 }
 
 export async function POST(req: NextRequest) {
-  // Read body once and store for potential fallback use
   let imageUrl = '';
   let filename = 'Uploaded Product';
 
   try {
-    const body = await req.json();
+    let body: any;
+    try {
+      body = await req.json();
+    } catch {
+      return NextResponse.json({ error: 'Invalid or oversized JSON body' }, { status: 400 });
+    }
+
     imageUrl = body.imageUrl || '';
     filename = body.filename || 'Uploaded Product';
 
@@ -129,7 +144,7 @@ export async function POST(req: NextRequest) {
     const apiKey = process.env.GEMINI_API_KEY || process.env.NEXT_PUBLIC_GEMINI_API_KEY;
 
     if (!apiKey) {
-      console.warn('[scan] GEMINI_API_KEY not configured — returning NOT_FOUND for all fields.');
+      console.warn('[scan] GEMINI_API_KEY not configured — returning fallback scan.');
       const scan = analyzePackageImage(imageUrl, filename);
       return NextResponse.json({ scan, source: 'no-api-key' });
     }
@@ -148,21 +163,26 @@ export async function POST(req: NextRequest) {
     let rawJsonResponseText = '';
     let usedModel = PRIMARY_MODEL;
 
-    // Execute with Primary Model (gemini-3.5-flash); on error, retry with Fallback Model (gemini-3.5-flash-lite)
+    // Fast primary execution with 6s timeout; on error or timeout, switch to fallback model
     try {
       console.log(`[scan] Attempting primary model: ${PRIMARY_MODEL}`);
-      rawJsonResponseText = await callGeminiVision(PRIMARY_MODEL, apiKey, mimeType, base64Data);
+      rawJsonResponseText = await withTimeout(
+        callGeminiVision(PRIMARY_MODEL, apiKey, mimeType, base64Data),
+        6000,
+        `Primary model (${PRIMARY_MODEL})`
+      );
     } catch (primaryError: any) {
-      console.warn(`[scan] Primary model (${PRIMARY_MODEL}) failed:`, primaryError?.message);
+      console.warn(`[scan] Primary model (${PRIMARY_MODEL}) failed or timed out:`, primaryError?.message);
       console.log(`[scan] Retrying with fallback model (${FALLBACK_MODEL})...`);
-
-      // 500ms delay before fallback attempt
-      await new Promise((resolve) => setTimeout(resolve, 500));
 
       try {
         usedModel = FALLBACK_MODEL;
         console.log(`[scan] Attempting fallback model: ${FALLBACK_MODEL}`);
-        rawJsonResponseText = await callGeminiVision(FALLBACK_MODEL, apiKey, mimeType, base64Data);
+        rawJsonResponseText = await withTimeout(
+          callGeminiVision(FALLBACK_MODEL, apiKey, mimeType, base64Data),
+          6000,
+          `Fallback model (${FALLBACK_MODEL})`
+        );
       } catch (fallbackError: any) {
         console.error(
           `[scan] Both models failed. Primary (${PRIMARY_MODEL}):`,
@@ -171,7 +191,7 @@ export async function POST(req: NextRequest) {
           fallbackError?.message
         );
         throw new Error(
-          `Gemini API call failed.\nPrimary (${PRIMARY_MODEL}): ${primaryError?.message || primaryError}\nFallback (${FALLBACK_MODEL}): ${fallbackError?.message || fallbackError}\n\nCheck that GEMINI_API_KEY in .env.local is a Google AI Studio key (starts with "AIza"), not a Vertex AI or service-account key.`
+          `Gemini API call failed.\nPrimary (${PRIMARY_MODEL}): ${primaryError?.message || primaryError}\nFallback (${FALLBACK_MODEL}): ${fallbackError?.message || fallbackError}`
         );
       }
     }
@@ -203,53 +223,54 @@ export async function POST(req: NextRequest) {
     if (compliantCount < 2) overallStatus = 'non_compliant';
     else if (compliantCount < 4) overallStatus = 'partially_compliant';
 
-    // --- Supabase: Upload image and persist scan ---
+    // --- Fast Supabase Persistence (with non-blocking storage fallback) ---
+    let publicImageUrl = imageUrl;
+    const timestampId = `scan-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
 
-    // 1. Upload the original image to the "packet-images" storage bucket
-    const imageBuffer = Buffer.from(base64Data, 'base64');
-    const ext = mimeType.split('/')[1]?.replace('+xml', '') || 'jpg';
-    const storagePath = `${Date.now()}-${Math.floor(Math.random() * 10000)}.${ext}`;
+    try {
+      const imageBuffer = Buffer.from(base64Data, 'base64');
+      const ext = mimeType.split('/')[1]?.replace('+xml', '') || 'jpg';
+      const storagePath = `${Date.now()}-${Math.floor(Math.random() * 10000)}.${ext}`;
 
-    const { error: uploadError } = await supabase.storage
-      .from('packet-images')
-      .upload(storagePath, imageBuffer, {
-        contentType: mimeType,
-        upsert: false,
-      });
+      const uploadPromise = supabase.storage
+        .from('packet-images')
+        .upload(storagePath, imageBuffer, { contentType: mimeType, upsert: false });
 
-    if (uploadError) {
-      console.error('[scan] Supabase storage upload error:', uploadError.message);
-      throw new Error(`Failed to upload image to Supabase Storage: ${uploadError.message}`);
+      const { data: uploadData, error: uploadError } = await withTimeout<any>(uploadPromise, 2500, 'Storage upload');
+      if (!uploadError && uploadData) {
+        const { data: urlData } = supabase.storage.from('packet-images').getPublicUrl(storagePath);
+        if (urlData?.publicUrl) {
+          publicImageUrl = urlData.publicUrl;
+        }
+      }
+    } catch (storageErr: any) {
+      console.warn('[scan] Storage upload skipped/timed out:', storageErr?.message);
     }
 
-    // 2. Get the public URL
-    const { data: publicUrlData } = supabase.storage
-      .from('packet-images')
-      .getPublicUrl(storagePath);
+    let scanId = timestampId;
+    try {
+      const insertPromise = supabase
+        .from('scans')
+        .insert({
+          image_url: publicImageUrl.startsWith('data:') ? 'uploaded_image' : publicImageUrl,
+          manufacturer: getFieldText(formattedFields, 'manufacturer'),
+          net_quantity: getFieldText(formattedFields, 'netQuantity'),
+          mrp: getFieldText(formattedFields, 'mrp'),
+          mfg_date: getFieldText(formattedFields, 'manufactureDate'),
+          consumer_care: getFieldText(formattedFields, 'consumerCare'),
+          score: compliantCount,
+        })
+        .select('id')
+        .single();
 
-    const publicImageUrl = publicUrlData.publicUrl;
-
-    // 3. Insert a row into the "scans" table
-    const { data: insertedRow, error: insertError } = await supabase
-      .from('scans')
-      .insert({
-        image_url: publicImageUrl,
-        manufacturer: getFieldText(formattedFields, 'manufacturer'),
-        net_quantity: getFieldText(formattedFields, 'netQuantity'),
-        mrp: getFieldText(formattedFields, 'mrp'),
-        mfg_date: getFieldText(formattedFields, 'manufactureDate'),
-        consumer_care: getFieldText(formattedFields, 'consumerCare'),
-        score: compliantCount,
-      })
-      .select('id')
-      .single();
-
-    if (insertError) {
-      console.error('[scan] Supabase insert error:', insertError.message);
-      throw new Error(`Failed to save scan to Supabase: ${insertError.message}`);
+      const { data: insertedRow, error: insertError } = await withTimeout<any>(insertPromise, 2000, 'DB insert');
+      if (insertedRow?.id && !insertError) {
+        scanId = insertedRow.id;
+      }
+    } catch (dbErr: any) {
+      console.warn('[scan] Supabase DB insert fallback to local id:', dbErr?.message);
     }
 
-    const scanId = insertedRow.id;
     const timestamp = new Date().toLocaleString('en-IN', {
       day: '2-digit',
       month: 'short',
