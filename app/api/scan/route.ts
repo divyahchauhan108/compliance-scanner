@@ -70,8 +70,8 @@ Respond ONLY with a valid raw JSON object strictly matching this format (no mark
   ]
 }`;
 
-const PRIMARY_MODEL = 'gemini-2.5-flash';
-const FALLBACK_MODEL = 'gemini-2.0-flash';
+const PRIMARY_MODEL = 'gemini-3.6-flash';
+const FALLBACK_MODEL = 'gemini-3.5-flash';
 
 /** Helper to execute Gemini vision call for a specific model name */
 async function callGeminiVision(
@@ -165,7 +165,7 @@ export async function POST(req: NextRequest) {
     let rawJsonResponseText = '';
     let usedModel = PRIMARY_MODEL;
 
-    // Execute with Primary Model (gemini-2.5-flash); on error, wait 1.5s and retry with Fallback Model (gemini-2.0-flash)
+    // Execute with Primary Model (gemini-3.6-flash); on error, wait 1.5s and retry with Fallback Model (gemini-3.5-flash)
     try {
       console.log(`[scan] Attempting primary model: ${PRIMARY_MODEL}`);
       rawJsonResponseText = await callGeminiVision(PRIMARY_MODEL, apiKey, mimeType, base64Data);
