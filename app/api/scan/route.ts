@@ -5,6 +5,9 @@ import { ComplianceScan, FieldResult } from '@/lib/types';
 import { analyzePackageImage } from '@/lib/scanner';
 import { supabase } from '@/lib/supabase';
 
+export const dynamic = 'force-dynamic';
+export const maxDuration = 60;
+
 const STRICT_PROMPT_INSTRUCTION = `You are an official Legal Metrology Compliance Inspector for packaged commodities in India under the Legal Metrology (Packaged Commodities) Rules, 2011.
 
 CRITICAL INSTRUCTION:

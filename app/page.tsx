@@ -6,6 +6,7 @@ import { UploadCloud, FileImage, ShieldCheck, ArrowRight, RefreshCw, CheckCircle
 import { SAMPLE_PACKAGES } from '@/lib/scanner';
 import { saveScan } from '@/lib/storage';
 import { SamplePackage } from '@/lib/types';
+import { compressImage } from '@/lib/imageUtils';
 
 export default function UploadPage() {
   const router = useRouter();
@@ -15,22 +16,43 @@ export default function UploadPage() {
   const [selectedFileName, setSelectedFileName] = useState<string>('');
   const [isDragging, setIsDragging] = useState(false);
   const [isScanning, setIsScanning] = useState(false);
+  const [isCompressing, setIsCompressing] = useState(false);
+  const [compressionDetails, setCompressionDetails] = useState<{ dimensions: string; sizeEstimate: string } | null>(null);
   const [scanStep, setScanStep] = useState('');
   const [apiError, setApiError] = useState<string | null>(null);
 
-  const handleFileChange = (file: File) => {
+  const handleFileChange = async (file: File) => {
     if (!file.type.startsWith('image/')) {
       alert('Please select a valid image file (PNG, JPG, WEBP).');
       return;
     }
     setSelectedFileName(file.name);
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      if (e.target?.result) {
-        setSelectedImage(e.target.result as string);
-      }
-    };
-    reader.readAsDataURL(file);
+    setApiError(null);
+    setIsCompressing(true);
+
+    try {
+      // Client-side compression using HTML Canvas API:
+      // Resizes so the longest side is <= 1600px and compresses to ~80% JPEG quality
+      const { dataUrl, width, height } = await compressImage(file, 1600, 0.8);
+      setSelectedImage(dataUrl);
+
+      const estimatedKb = Math.round((dataUrl.length * 0.75) / 1024);
+      setCompressionDetails({
+        dimensions: `${width}×${height}px`,
+        sizeEstimate: estimatedKb > 1024 ? `${(estimatedKb / 1024).toFixed(1)} MB` : `${estimatedKb} KB`,
+      });
+    } catch (err) {
+      console.warn('Canvas compression fallback to raw data URL:', err);
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        if (e.target?.result) {
+          setSelectedImage(e.target.result as string);
+        }
+      };
+      reader.readAsDataURL(file);
+    } finally {
+      setIsCompressing(false);
+    }
   };
 
   const handleInputChange = (e: ChangeEvent<HTMLInputElement>) => {
@@ -60,13 +82,14 @@ export default function UploadPage() {
   const handleSelectSample = (sample: SamplePackage) => {
     setSelectedImage(sample.imageUrl);
     setSelectedFileName(sample.name);
+    setCompressionDetails(null);
   };
 
   const handleScanNow = async () => {
     if (!selectedImage) return;
 
     setIsScanning(true);
-    setScanStep('Sending image to strict Gemini Vision API (Temperature: 0)...');
+    setScanStep('Preparing image...');
 
     try {
       // Check if sample package was selected
@@ -100,12 +123,21 @@ export default function UploadPage() {
         saveScan(resultScan);
         router.push(`/results/${resultScan.id}`);
       } else {
+        setScanStep('Compressing & validating image size...');
+        let payloadImage = selectedImage;
+        try {
+          const compressed = await compressImage(selectedImage, 1600, 0.8);
+          payloadImage = compressed.dataUrl;
+        } catch {
+          // fallback to selectedImage
+        }
+
         setScanStep('Sending image to Gemini Vision API...');
         const res = await fetch('/api/scan', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            imageUrl: selectedImage,
+            imageUrl: payloadImage,
             filename: selectedFileName || 'Uploaded Package Image',
           }),
         });
@@ -274,6 +306,18 @@ export default function UploadPage() {
                 <FileImage className="w-4 h-4 text-[#1E3A8A]" />
                 <span>{selectedFileName || 'Selected Package Image'}</span>
               </div>
+              {compressionDetails && (
+                <div className="flex items-center justify-center gap-1.5 text-[11px] text-green-700 bg-green-50 border border-green-200 px-3 py-1 rounded-full w-fit mx-auto font-medium shadow-2xs">
+                  <CheckCircle2 className="w-3.5 h-3.5 text-green-600" />
+                  <span>Optimized: {compressionDetails.dimensions} ({compressionDetails.sizeEstimate})</span>
+                </div>
+              )}
+              {isCompressing && (
+                <div className="flex items-center justify-center gap-2 text-xs text-blue-700 font-medium animate-pulse">
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                  <span>Optimizing camera photo for fast upload...</span>
+                </div>
+              )}
               <p className="text-[11px] text-gray-400">Click or drag a new image to replace</p>
             </div>
           ) : (
