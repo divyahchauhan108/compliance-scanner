@@ -73,8 +73,8 @@ Respond ONLY with a valid raw JSON object strictly matching this format (no mark
   ]
 }`;
 
-const PRIMARY_MODEL = 'gemini-3.6-flash';
-const FALLBACK_MODEL = 'gemini-3.5-flash';
+const PRIMARY_MODEL = 'gemini-3.5-flash';
+const FALLBACK_MODEL = 'gemini-3.5-flash-lite';
 
 /** Helper to execute Gemini vision call for a specific model name */
 async function callGeminiVision(
@@ -83,47 +83,27 @@ async function callGeminiVision(
   mimeType: string,
   base64Data: string
 ): Promise<string> {
-  // First try with @google/genai
-  try {
-    const ai = new GoogleGenAI({ apiKey });
-    const response = await ai.models.generateContent({
-      model: modelName,
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            { inlineData: { mimeType, data: base64Data } },
-            { text: STRICT_PROMPT_INSTRUCTION },
-          ],
-        },
-      ],
-      config: {
-        temperature: 0,
-        responseMimeType: 'application/json',
-      },
-    });
-    if (response.text) {
-      return response.text;
-    }
-  } catch (genAiError: any) {
-    console.warn(`[scan] @google/genai attempt with ${modelName} failed:`, genAiError?.message);
-  }
-
-  // Fallback SDK attempt with @google/generative-ai
-  const genAI = new GoogleGenerativeAI(apiKey);
-  const model = genAI.getGenerativeModel({
+  const ai = new GoogleGenAI({ apiKey });
+  const response = await ai.models.generateContent({
     model: modelName,
-    generationConfig: {
+    contents: [
+      {
+        role: 'user',
+        parts: [
+          { inlineData: { mimeType, data: base64Data } },
+          { text: STRICT_PROMPT_INSTRUCTION },
+        ],
+      },
+    ],
+    config: {
       temperature: 0,
       responseMimeType: 'application/json',
     },
   });
-  const result = await model.generateContent([
-    STRICT_PROMPT_INSTRUCTION,
-    { inlineData: { mimeType, data: base64Data } },
-  ]);
-  const res = await result.response;
-  return res.text();
+  if (!response.text) {
+    throw new Error(`Empty response returned from ${modelName}`);
+  }
+  return response.text;
 }
 
 /** Helper: extract a field's text from the formatted fields array */
@@ -168,16 +148,16 @@ export async function POST(req: NextRequest) {
     let rawJsonResponseText = '';
     let usedModel = PRIMARY_MODEL;
 
-    // Execute with Primary Model (gemini-3.6-flash); on error, wait 1.5s and retry with Fallback Model (gemini-3.5-flash)
+    // Execute with Primary Model (gemini-3.5-flash); on error, retry with Fallback Model (gemini-3.5-flash-lite)
     try {
       console.log(`[scan] Attempting primary model: ${PRIMARY_MODEL}`);
       rawJsonResponseText = await callGeminiVision(PRIMARY_MODEL, apiKey, mimeType, base64Data);
     } catch (primaryError: any) {
       console.warn(`[scan] Primary model (${PRIMARY_MODEL}) failed:`, primaryError?.message);
-      console.log(`[scan] Waiting 1.5s before retrying with fallback model (${FALLBACK_MODEL})...`);
+      console.log(`[scan] Retrying with fallback model (${FALLBACK_MODEL})...`);
 
-      // 1.5 second delay before fallback attempt
-      await new Promise((resolve) => setTimeout(resolve, 1500));
+      // 500ms delay before fallback attempt
+      await new Promise((resolve) => setTimeout(resolve, 500));
 
       try {
         usedModel = FALLBACK_MODEL;
